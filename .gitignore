@@ -1,0 +1,14 @@
+# Python 字节码缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 本地接力状态
+.butler-relay.json
+.butler-relay.json.tmp
+.butler-relay.log
+
+# Python 构建产物
+build/
+dist/
+*.egg-info/

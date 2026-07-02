@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-butler-relay"
+version = "0.1.0"
+description = "Codex 规划、Claude/Butler 执行的轻量任务接力器"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{name = "xiaogege6697"}]
+dependencies = []
+
+[project.scripts]
+butler-relay = "relay:main"
+
+[tool.setuptools]
+py-modules = ["relay"]

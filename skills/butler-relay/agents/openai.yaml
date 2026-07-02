@@ -1,0 +1,4 @@
+interface:
+  display_name: "管家接力器"
+  short_description: "让 Codex 规划并将任务接力给前台 Claude 执行"
+  default_prompt: "使用 $butler-relay 规划任务并交给前台 Claude/Butler 继续执行。"
