@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -58,6 +59,35 @@ def update_state(project: Path, **values: str) -> None:
 
 def save_session(project: Path, session_id: str, **extra: str) -> None:
     update_state(project, session_id=session_id, **extra)
+
+
+def project_cache_dir(project: Path) -> Path:
+    digest = hashlib.sha256(str(project).encode("utf-8")).hexdigest()[:16]
+    return CACHE_DIR / "projects" / digest
+
+
+def write_detached_result(path: Path, result: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(result, encoding="utf-8")
+
+
+def notify_terminal(signal: str, project: Path) -> None:
+    messages = {
+        "GOAL_DONE": "Claude 已完成；Codex 将在下一次低频检查时验收",
+        "NEED_DECISION": "Claude 需要关键决策；Codex 将在下一次检查时接手",
+        "PROTOCOL_ERROR": "Claude 已返回但缺少终态；Codex 将在下一次检查时处理",
+        "ERROR": "接力任务异常退出；Codex 将在下一次检查时处理",
+    }
+    body = messages.get(signal)
+    if not body or not shutil.which("osascript"):
+        return
+    script = (
+        f"display notification {json.dumps(body, ensure_ascii=False)} "
+        f"with title {json.dumps(f'管家接力器 · {project.name}', ensure_ascii=False)}"
+    )
+    subprocess.run(
+        ["osascript", "-e", script], check=False, capture_output=True, text=True
+    )
 
 
 def first_nonblank_line(text: str) -> str:
@@ -533,20 +563,153 @@ def relay_headless(project: Path, text: str, *, force_new: bool = False) -> str:
     return result
 
 
+def start_detached(
+    project: Path,
+    text: str,
+    *,
+    goal: bool,
+    force_new: bool,
+    headless: bool,
+) -> dict[str, str]:
+    job_id = str(uuid.uuid4())
+    cache = project_cache_dir(project)
+    cache.mkdir(parents=True, exist_ok=True)
+    job_path = cache / f"job-{job_id}.json"
+    result_path = cache / f"result-{job_id}.md"
+    log_path = cache / f"worker-{job_id}.log"
+    job_path.write_text(
+        json.dumps(
+            {
+                "project": str(project),
+                "text": text,
+                "goal": goal,
+                "force_new": force_new,
+                "headless": headless,
+                "result_path": str(result_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    if goal:
+        update_state(
+            project,
+            goal=text,
+            goal_status="starting",
+            last_signal="GOAL_STARTED",
+            poll_interval_minutes="10",
+            result_path=str(result_path),
+            log_path=str(log_path),
+        )
+    elif load_state(project).get("goal"):
+        update_state(
+            project,
+            goal_status="starting",
+            last_signal="CONTINUING",
+            poll_interval_minutes="10",
+            result_path=str(result_path),
+            log_path=str(log_path),
+        )
+    command = [sys.executable, str(Path(__file__).resolve()), "--worker", str(job_path)]
+    with log_path.open("ab") as log:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    return {
+        "signal": "GOAL_STARTED",
+        "project": str(project),
+        "worker_pid": str(process.pid),
+    }
+
+
+def run_detached_job(job_path: Path) -> int:
+    try:
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        project = Path(job["project"]).resolve()
+        result_path = Path(job["result_path"])
+        raw_text = str(job["text"])
+        is_goal = bool(job["goal"])
+        text = goal_prompt(raw_text) if is_goal else raw_text
+        if is_goal:
+            update_state(project, goal=raw_text, goal_status="running", last_signal="STARTED")
+        elif load_state(project).get("goal"):
+            update_state(project, goal_status="running", last_signal="CONTINUED")
+        relay = relay_headless if bool(job["headless"]) else relay_native
+        result = relay(project, text, force_new=bool(job["force_new"]) or is_goal)
+        write_detached_result(result_path, result)
+        update_goal_from_result(project, result)
+        signal = goal_signal(result)
+        if signal == "RUNNING":
+            update_state(project, goal_status="protocol_error", last_signal="PROTOCOL_ERROR")
+            signal = "PROTOCOL_ERROR"
+        update_state(
+            project,
+            result_path=str(result_path),
+            finished_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        )
+        notify_terminal(signal, project)
+        return 0
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+        project_value = locals().get("project")
+        result_value = locals().get("result_path")
+        if isinstance(project_value, Path):
+            if isinstance(result_value, Path):
+                write_detached_result(result_value, f"RELAY_FAILED\n{exc}")
+            update_state(
+                project_value,
+                goal_status="failed",
+                last_signal="ERROR",
+                finished_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            )
+            notify_terminal("ERROR", project_value)
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+def collect_result(project: Path) -> tuple[str, int]:
+    state = load_state(project)
+    result_path = state.get("result_path")
+    if result_path and Path(result_path).is_file():
+        return Path(result_path).read_text(encoding="utf-8"), 0
+    status = state.get("goal_status")
+    if status in {"starting", "running", "switching_window"}:
+        try:
+            current = max(1, int(state.get("poll_interval_minutes", "10")))
+        except ValueError:
+            current = 10
+        next_interval = current * 2
+        update_state(project, poll_interval_minutes=str(next_interval))
+        return f"GOAL_RUNNING\nNEXT_CHECK_MINUTES={next_interval}", 0
+    if status == "accepted":
+        return "GOAL_ACCEPTED", 0
+    return "NO_RESULT", 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Codex ↔ Claude 轻量 Goal Loop 接力器")
     parser.add_argument("text", nargs="*", help="发送给 Claude 的文本；省略则从 stdin 读取")
     parser.add_argument("--project", default=".", help="Claude 工作目录，默认当前目录")
     parser.add_argument("--new", action="store_true", help="主动新开 Claude 窗口")
     parser.add_argument("--headless", action="store_true", help="显式使用非交互 -p 模式")
+    parser.add_argument("--detach", action="store_true", help="后台等待终态并立即返回")
+    parser.add_argument("--collect", action="store_true", help="读取后台任务终态结果")
     parser.add_argument("--check", action="store_true", help="检测本机运行条件")
     parser.add_argument("--status", action="store_true", help="查看当前项目接力状态")
     parser.add_argument("--goal", action="store_true", help="启动新的 Goal Loop")
     parser.add_argument("--accept", action="store_true", help="标记当前 Goal 已通过 Codex 验收")
+    parser.add_argument("--worker", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    if sum((args.check, args.status, args.accept)) > 1:
-        parser.error("--check、--status 与 --accept 不能同时使用")
+    if args.worker:
+        return run_detached_job(Path(args.worker))
+    if sum((args.check, args.status, args.collect, args.accept)) > 1:
+        parser.error("--check、--status、--collect 与 --accept 不能同时使用")
     project = Path(args.project).expanduser().resolve()
     if not project.is_dir():
         parser.error(f"项目目录不存在：{project}")
@@ -557,6 +720,10 @@ def main() -> int:
     if args.status:
         print(json.dumps(relay_status(project), ensure_ascii=False, indent=2))
         return 0
+    if args.collect:
+        result, code = collect_result(project)
+        print(result)
+        return code
     if args.accept:
         if not load_state(project).get("goal"):
             parser.error("当前项目没有 Goal 可验收")
@@ -567,6 +734,16 @@ def main() -> int:
     text = " ".join(args.text).strip() if args.text else sys.stdin.read().strip()
     if not text:
         parser.error("转发文本不能为空")
+    if args.detach:
+        started = start_detached(
+            project,
+            text,
+            goal=args.goal,
+            force_new=args.new,
+            headless=args.headless,
+        )
+        print(json.dumps(started, ensure_ascii=False))
+        return 0
     if args.goal:
         update_state(project, goal=text, goal_status="running", last_signal="STARTED")
         text = goal_prompt(text)

@@ -1,6 +1,6 @@
 # Codex 自动管家接力器
 
-一个轻量、跨模型的 Goal Loop：用户只向 Codex 说明目标，Codex 把目标交给前台 Claude Code；Claude 加载 Butler 后自主执行，必要时调用低成本临时工模型；完成后 Codex 只做最终验收。
+一个异步、轻量、跨模型的 Goal Loop：用户只向 Codex 说明目标，Codex 把目标交给前台 Claude Code 后立即结束当前回合；Claude 加载 Butler 后自主执行；Codex 首次 10 分钟检查，未完成则按 20、40、80 分钟指数退避，终态后自动验收。
 
 它解决的不是“如何让模型遵守更多流程”，而是“如何用最少的协调成本，让不同价位模型完成同一个项目”。
 
@@ -26,17 +26,17 @@
 ```mermaid
 flowchart LR
     U[用户一句话目标] --> C[Codex 明确目标与边界]
-    C --> R[Relay 一次投递]
+    C --> R[Relay 异步投递后立即返回]
     R --> B[Claude + Butler 自主执行]
     B -->|适合时| W[低成本临时工]
     W --> B
-    B -->|GOAL_DONE| V[Codex 真实验收]
+    B -->|10→20→40→80 分钟检查| V[Codex 收取终态并真实验收]
     B -->|NEED_DECISION| C
     B -->|NEW_WINDOW| R
     V --> O[交付成果]
 ```
 
-理想状态下，Codex 只高强度工作两次：开始时把目标讲清楚，结束时验证成果。执行过程留在可见的 Claude TUI 中。
+理想状态下，Codex 只高强度工作两次：开始时把目标讲清楚，结束时验证成果。中间 heartbeat 只调用一次 `--collect`；仍运行就静默结束并把下次间隔翻倍，不读取项目、不检查 screen、不播报等待理由。
 
 ## 核心能力
 
@@ -44,7 +44,10 @@ flowchart LR
 - **自动转发与续接**：新 Goal 新建 session；后续任务续接同一 session，避免重复加载 Butler。
 - **自动处理常规阻塞**：识别首次目录信任提示，使用 Claude `auto` permission mode 处理项目内常规操作。
 - **可靠长文本投递**：按 UTF-8 字节安全分块，并以 transcript marker 确认消息确实送达。
-- **事件式返回**：普通进度不回流 Codex；只在完成、关键决策或换窗时返回。
+- **异步低频监测**：`--detach` 派发后立即返回，同线程 heartbeat 首次 10 分钟检查。
+- **指数退避**：`GOAL_RUNNING` 后续间隔自动翻倍为 20、40、80 分钟……不设任务超时。
+- **静默运行态**：运行中不产生进度播报；终态后停止 heartbeat 并进入验收。
+- **终态通知**：macOS 通知作为 Codex App heartbeat 之外的兜底。
 - **安全换窗**：context 质量下降时自动携带交接信息开启新窗口，并关闭被替换的 Relay screen。
 - **不限运行时间**：大项目耗时长是正常现象；进程健康时不以时间判失败。
 
@@ -66,11 +69,14 @@ butler-relay --check
 ## 使用
 
 ```bash
-# 启动新 Goal，并打开真实 Claude TUI
-butler-relay --goal --project /path/to/project "目标、边界与验收标准"
+# 异步启动新 Goal，并打开真实 Claude TUI；命令立即返回
+butler-relay --detach --goal --project /path/to/project "目标、边界与验收标准"
 
-# 续接当前项目
-butler-relay --project /path/to/project "下一阶段任务"
+# heartbeat 每次只执行这一条；运行中会返回下一次检查间隔
+butler-relay --collect --project /path/to/project
+
+# 异步续接当前项目
+butler-relay --detach --project /path/to/project "下一阶段任务"
 
 # 仅在用户明确查询或已有故障证据时查看状态
 butler-relay --status --project /path/to/project
@@ -82,7 +88,9 @@ butler-relay --accept --project /path/to/project
 butler-relay --headless --project /path/to/project "任务文本"
 ```
 
-状态只写入目标项目根目录的 `.butler-relay.json`。Claude transcript 仍由 Claude Code 自己管理。
+状态只写入目标项目根目录的 `.butler-relay.json`；后台结果和日志写入 `~/.cache/codex-butler-relay/`，不污染项目源码。Claude transcript 仍由 Claude Code 自己管理。
+
+不加 `--detach` 时仍保留原同步行为，供手动 CLI 调试使用。Codex Skill 默认只使用异步模式。
 
 ## 三个终态信号
 
@@ -95,6 +103,8 @@ butler-relay --headless --project /path/to/project "任务文本"
 ## 设计边界
 
 Relay 不做任务拆分、模型路由、数据库、Dashboard、成本报表或复杂状态机。它只负责：启动、投递、续接、等待终态和换窗。
+
+Relay 不会尝试用非官方方式启动第二条 Codex 模型链。Codex App 使用同线程 heartbeat 做指数退避检查；其他环境退化为 macOS 通知和手动 `--collect`。
 
 Claude 与 Butler 负责执行策略；临时工可以是 MiMo、DeepSeek 或任何可用且便宜的模型。Codex 不在线“盯过程”，而是拥有目标与最终裁决权。
 

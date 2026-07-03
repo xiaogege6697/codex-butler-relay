@@ -368,6 +368,95 @@ class RelayTest(unittest.TestCase):
             self.assertEqual(relay.main(), 0)
         self.assertEqual(relay.load_state(self.project)["goal_status"], "accepted")
 
+    @patch("relay.subprocess.Popen")
+    def test_detached_start_returns_without_waiting(self, popen):
+        popen.return_value.pid = 4321
+        with patch("relay.CACHE_DIR", self.project / "cache"):
+            started = relay.start_detached(
+                self.project,
+                "完成项目",
+                goal=True,
+                force_new=False,
+                headless=False,
+            )
+        self.assertEqual(started["signal"], "GOAL_STARTED")
+        self.assertEqual(started["worker_pid"], "4321")
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        state = relay.load_state(self.project)
+        self.assertEqual(state["goal_status"], "starting")
+        self.assertEqual(state["poll_interval_minutes"], "10")
+
+    @patch("relay.notify_terminal")
+    @patch("relay.relay_native", return_value="GOAL_DONE\n成果")
+    def test_detached_worker_persists_terminal_result(self, relay_native, notify):
+        result_path = self.project / "result.md"
+        job_path = self.project / "job.json"
+        job_path.write_text(
+            json.dumps(
+                {
+                    "project": str(self.project),
+                    "text": "完成项目",
+                    "goal": True,
+                    "force_new": False,
+                    "headless": False,
+                    "result_path": str(result_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(relay.run_detached_job(job_path), 0)
+        self.assertEqual(result_path.read_text(encoding="utf-8"), "GOAL_DONE\n成果")
+        state = relay.load_state(self.project)
+        self.assertEqual(state["goal_status"], "awaiting_acceptance")
+        self.assertEqual(state["last_signal"], "GOAL_DONE")
+        notify.assert_called_once_with("GOAL_DONE", self.project.resolve())
+
+    def test_collect_reports_running_then_reads_result(self):
+        relay.update_state(
+            self.project, goal_status="running", poll_interval_minutes="10"
+        )
+        self.assertEqual(
+            relay.collect_result(self.project),
+            ("GOAL_RUNNING\nNEXT_CHECK_MINUTES=20", 0),
+        )
+        self.assertEqual(
+            relay.collect_result(self.project),
+            ("GOAL_RUNNING\nNEXT_CHECK_MINUTES=40", 0),
+        )
+        result_path = self.project / "result.md"
+        result_path.write_text("GOAL_DONE\n成果", encoding="utf-8")
+        relay.update_state(self.project, result_path=str(result_path))
+        self.assertEqual(
+            relay.collect_result(self.project), ("GOAL_DONE\n成果", 0)
+        )
+
+    @patch("relay.start_detached")
+    def test_detach_cli_starts_background_goal(self, start_detached):
+        start_detached.return_value = {
+            "signal": "GOAL_STARTED",
+            "project": str(self.project),
+            "worker_pid": "123",
+        }
+        with patch(
+            "relay.sys.argv",
+            [
+                "relay.py",
+                "--detach",
+                "--goal",
+                "--project",
+                str(self.project),
+                "完成项目",
+            ],
+        ):
+            self.assertEqual(relay.main(), 0)
+        start_detached.assert_called_once_with(
+            self.project.resolve(),
+            "完成项目",
+            goal=True,
+            force_new=False,
+            headless=False,
+        )
+
     @patch("relay.relay_native", return_value="GOAL_DONE\n完成")
     def test_goal_cli_starts_fresh_session_and_sends_contract(self, relay_native):
         with patch(
