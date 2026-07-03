@@ -55,6 +55,19 @@ class RelayTest(unittest.TestCase):
         self.assertTrue(continued.startswith("继续"))
         self.assertNotIn("/butler", continued)
 
+    @patch("relay.wait_for_native_reply", return_value="完成")
+    @patch("relay.time.sleep")
+    @patch("relay._screen_command")
+    def test_native_turn_allows_tui_to_consume_text_before_enter(
+        self, screen_command, sleep, wait_reply
+    ):
+        relay.send_native_turn(
+            "screen-one", "session-one", "任务", load_butler=False
+        )
+        self.assertEqual(screen_command.call_count, 2)
+        sleep.assert_called_once_with(0.1)
+        self.assertEqual(screen_command.call_args_list[1].args[-1], "\r")
+
     @patch("relay.time.sleep")
     @patch("relay.subprocess.Popen")
     def test_screen_launcher_does_not_wait_for_interactive_process(self, popen, sleep):
@@ -169,6 +182,41 @@ class RelayTest(unittest.TestCase):
     def test_native_ready_detects_real_tui(self, alive, snapshot, sleep):
         relay.wait_for_native_ready("screen-one")
         sleep.assert_not_called()
+
+    @patch("relay.time.sleep")
+    @patch("relay._screen_command")
+    @patch(
+        "relay.native_screen_snapshot",
+        side_effect=[
+            "Quick safety check: Yes, I trust this folder Enter to confirm",
+            "Welcome back!",
+        ],
+    )
+    @patch("relay.screen_is_alive", return_value=True)
+    def test_native_ready_confirms_first_directory_trust_once(
+        self, alive, snapshot, screen_command, sleep
+    ):
+        relay.wait_for_native_ready("screen-one")
+        screen_command.assert_called_once_with(
+            "-S", "screen-one", "-p", "0", "-X", "stuff", "\r"
+        )
+
+    @patch("relay.time.sleep")
+    @patch("relay._screen_command")
+    @patch(
+        "relay.native_screen_snapshot",
+        side_effect=[
+            "Quick safety check: Yes, I trust this folder Enter to confirm",
+            "Quick safety check: Yes, I trust this folder Enter to confirm",
+            "Welcome back!",
+        ],
+    )
+    @patch("relay.screen_is_alive", return_value=True)
+    def test_native_ready_never_repeats_trust_confirmation(
+        self, alive, snapshot, screen_command, sleep
+    ):
+        relay.wait_for_native_ready("screen-one")
+        self.assertEqual(screen_command.call_count, 1)
 
     @patch("relay.time.sleep")
     @patch("relay.screen_status", side_effect=["detached", "attached"])

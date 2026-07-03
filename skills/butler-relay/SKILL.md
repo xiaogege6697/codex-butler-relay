@@ -12,7 +12,7 @@ Use Codex for planning, key decisions, and acceptance. Use Claude Code with `/bu
 1. Resolve the target project directory. Ask only when it cannot be inferred safely.
 2. Run `butler-relay --check` before the first relay in the current environment. Report missing dependencies instead of silently changing models or modes.
 3. Turn the user's sentence into one concise goal containing the objective, relevant context, constraints, and verifiable acceptance criteria. Make reasonable implementation decisions without asking the user.
-4. Start a fresh visible Goal Loop. A new Goal always gets a new Claude session and loads `/butler` once:
+4. Start a fresh visible Goal Loop. A new Goal always gets a new Claude session and loads `/butler` once. The relay automatically confirms Claude's first-use directory trust prompt only when the expected trust option is detected:
 
    ```bash
    butler-relay --goal --project "/absolute/project/path" "目标与验收标准"

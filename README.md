@@ -20,6 +20,8 @@ butler-relay --check
 
 `--check` 会检查 macOS、Python、Claude Code 与 GNU screen 版本、Terminal、Claude transcript 目录及 `/butler` Skill。长任务没有时间上限；只有 Claude/screen 已退出，或本轮明确结束但无法匹配回复时，接力器才会报错停止等待。
 
+Claude 首次进入某个项目目录时，接力器会识别目录信任提示，并在默认选中“信任此目录”时自动确认，然后继续加载真实 TUI。
+
 将 `skills/butler-relay` 安装到 Codex Skills 后，可以直接说“打开接力器，把这个任务交给 Claude”。
 
 ## 使用

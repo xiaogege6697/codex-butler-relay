@@ -153,11 +153,21 @@ def native_screen_snapshot(screen_name: str) -> str:
 
 def wait_for_native_ready(screen_name: str) -> None:
     ready_markers = ("Welcome back!", "Tips for getting started", "auto mode on")
+    trust_markers = (
+        "Quick safety check:",
+        "Yes, I trust this folder",
+        "Enter to confirm",
+    )
+    trust_confirmed = False
     while True:
         if not screen_is_alive(screen_name):
             raise RuntimeError("交互式 Claude 在就绪前退出")
-        if any(marker in native_screen_snapshot(screen_name) for marker in ready_markers):
+        snapshot = native_screen_snapshot(screen_name)
+        if any(marker in snapshot for marker in ready_markers):
             return
+        if not trust_confirmed and all(marker in snapshot for marker in trust_markers):
+            _screen_command("-S", screen_name, "-p", "0", "-X", "stuff", "\r")
+            trust_confirmed = True
         time.sleep(0.25)
 
 
@@ -255,6 +265,8 @@ def send_native_turn(
     marker = f"[relay-marker:{uuid.uuid4()}]"
     prompt = turn_prompt(text, marker, load_butler=load_butler)
     _screen_command("-S", screen_name, "-p", "0", "-X", "stuff", prompt)
+    # Claude TUI 处理长文本需要一个极短间隔，否则紧随其后的 Enter 偶尔会被吞掉。
+    time.sleep(0.1)
     _screen_command("-S", screen_name, "-p", "0", "-X", "stuff", "\r")
     return wait_for_native_reply(session_id, marker, screen_name)
 
