@@ -24,6 +24,9 @@ TRANSCRIPT_ROOT = Path(
 )
 CACHE_DIR = Path.home() / ".cache" / "codex-butler-relay"
 SIGNALS = {"GOAL_DONE", "NEED_DECISION", "NEW_WINDOW"}
+DELIVERY_ATTEMPTS = 3
+DELIVERY_CHECKS = 20
+SCREEN_STUFF_MAX_BYTES = 160
 
 
 def load_state(project: Path) -> dict[str, str]:
@@ -62,21 +65,28 @@ def first_nonblank_line(text: str) -> str:
 
 
 def goal_signal(text: str) -> str:
-    first_line = first_nonblank_line(text)
-    return first_line if first_line in SIGNALS else "RUNNING"
+    nonblank = [line.strip() for line in text.splitlines() if line.strip()]
+    for index, line in enumerate(nonblank):
+        if line in SIGNALS:
+            return line
+        if index >= 4:
+            break
+    if nonblank:
+        final_line = nonblank[-1]
+        for signal in SIGNALS:
+            if final_line.startswith((f"{signal} ", f"{signal}：", f"{signal}:")):
+                return signal
+    return "RUNNING"
 
 
 def goal_prompt(text: str) -> str:
     return (
-        "进入 Goal Loop，持续执行直至出现终态。普通进度只在当前 Claude TUI 展示，"
-        "不要因此结束本轮。仅在以下情况结束回复：完成时首行 GOAL_DONE；需要关键决策时"
-        "首行 NEED_DECISION；context 质量下降需换窗时首行 NEW_WINDOW，并附完整交接。\n"
-        "context 约 60% 时开始阶段收尾与整理交接；超过 70% 时直接返回 NEW_WINDOW，"
-        "不要等到窗口堆满。\n"
-        "本 Goal 已授权沿用当前临时工配置并自动检测；配置可用时不要询问，只有失效或额度"
-        "问题才返回 NEED_DECISION。非核心任务仅在“临时工执行 + Claude 审核 + 预期返工”"
-        "成本低于 Claude 直接完成，且结果可客观验证时外包；关键判断与最终审核由你负责。\n\n"
-        f"{text}"
+        f"目标：{text}\n"
+        "边界：你拥有项目内完整执行权限；加载 Butler 后自主规划、选工具并决定是否调用"
+        "低成本临时工，关键判断与最终审核由你负责。仅在依赖失效、额度异常或确需用户"
+        "关键决策时暂停。\n"
+        "终态：完成首行 GOAL_DONE；需决策首行 NEED_DECISION；context 质量下降需换窗首行"
+        " NEW_WINDOW 并附完整交接。普通进度留在当前 Claude TUI，不要结束本轮。"
     )
 
 
@@ -209,6 +219,26 @@ def transcript_reply(path: Path, marker: str) -> str | None:
     return None
 
 
+def transcript_request_seen(path: Path, marker: str) -> bool:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "user" and marker in line:
+            return True
+    return False
+
+
+def native_request_seen(session_id: str, marker: str) -> bool:
+    transcript = find_transcript(session_id)
+    return bool(transcript and transcript_request_seen(transcript, marker))
+
+
 def transcript_turn_ended_without_marker(path: Path, marker: str) -> bool:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -255,6 +285,52 @@ def turn_prompt(text: str, marker: str, *, load_butler: bool) -> str:
     return f"{prefix}{text}\n\n回复末尾原样保留 {marker}"
 
 
+def screen_text_chunks(text: str, max_bytes: int = SCREEN_STUFF_MAX_BYTES) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    current_bytes = 0
+    for character in text:
+        size = len(character.encode("utf-8"))
+        if current and current_bytes + size > max_bytes:
+            chunks.append(current)
+            current = ""
+            current_bytes = 0
+        current += character
+        current_bytes += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def stuff_native_text(screen_name: str, text: str) -> None:
+    for chunk in screen_text_chunks(text):
+        _screen_command("-S", screen_name, "-p", "0", "-X", "stuff", chunk)
+        time.sleep(0.01)
+
+
+def deliver_native_prompt(
+    screen_name: str,
+    session_id: str,
+    prompt: str,
+    marker: str,
+) -> None:
+    for attempt in range(DELIVERY_ATTEMPTS):
+        snapshot = native_screen_snapshot(screen_name) if attempt else ""
+        # 首次正常输入；若前两轮完全未进入输入框，最后一轮重发全文。
+        if attempt == 0 or (attempt == DELIVERY_ATTEMPTS - 1 and marker not in snapshot):
+            stuff_native_text(screen_name, prompt)
+            time.sleep(0.25)
+        # 第二轮只补 Enter，可处理“文字已在输入框但提交键被吞”的情况。
+        _screen_command("-S", screen_name, "-p", "0", "-X", "stuff", "\r")
+        for _ in range(DELIVERY_CHECKS):
+            if native_request_seen(session_id, marker):
+                return
+            if not screen_is_alive(screen_name):
+                raise RuntimeError("Claude/screen 在消息投递确认前退出")
+            time.sleep(0.25)
+    raise RuntimeError("Claude 首条消息投递失败：3 次后 transcript 仍未出现 relay marker")
+
+
 def send_native_turn(
     screen_name: str,
     session_id: str,
@@ -264,10 +340,7 @@ def send_native_turn(
 ) -> str:
     marker = f"[relay-marker:{uuid.uuid4()}]"
     prompt = turn_prompt(text, marker, load_butler=load_butler)
-    _screen_command("-S", screen_name, "-p", "0", "-X", "stuff", prompt)
-    # Claude TUI 处理长文本需要一个极短间隔，否则紧随其后的 Enter 偶尔会被吞掉。
-    time.sleep(0.1)
-    _screen_command("-S", screen_name, "-p", "0", "-X", "stuff", "\r")
+    deliver_native_prompt(screen_name, session_id, prompt, marker)
     return wait_for_native_reply(session_id, marker, screen_name)
 
 
@@ -277,7 +350,10 @@ def start_native(project: Path, text: str) -> tuple[str, str, str]:
     _start_screen(project, screen_name, os.environ.get("SHELL", "/bin/zsh"), "-l")
     save_session(project, session_id, screen_name=screen_name, mode="interactive")
     ensure_screen_attached(screen_name)
-    launch = f"exec {shlex.quote(CLAUDE)} --session-id {shlex.quote(session_id)}"
+    launch = (
+        f"exec {shlex.quote(CLAUDE)} --session-id {shlex.quote(session_id)} "
+        "--permission-mode auto"
+    )
     _screen_command("-S", screen_name, "-p", "0", "-X", "stuff", launch)
     _screen_command("-S", screen_name, "-p", "0", "-X", "stuff", "\r")
     wait_for_native_ready(screen_name)

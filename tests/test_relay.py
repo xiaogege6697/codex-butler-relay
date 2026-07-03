@@ -38,15 +38,32 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(relay.goal_signal("NEED_DECISION\n选项"), "NEED_DECISION")
         self.assertEqual(relay.goal_signal("普通进度"), "RUNNING")
 
-    def test_goal_prompt_encodes_economic_and_event_contract(self):
+    def test_goal_signal_tolerates_short_preamble_but_requires_exact_line(self):
+        self.assertEqual(
+            relay.goal_signal("全部验证通过。GOAL_DONE。\n---\nGOAL_DONE\n结果"),
+            "GOAL_DONE",
+        )
+        self.assertEqual(relay.goal_signal("正文提到 GOAL_DONE 但不是终态"), "RUNNING")
+
+    def test_goal_signal_accepts_signal_prefixed_final_summary(self):
+        self.assertEqual(
+            relay.goal_signal("核对完成\nGOAL_DONE 只读检查通过"), "GOAL_DONE"
+        )
+        self.assertEqual(
+            relay.goal_signal("NEED_DECISION 请选择发布目标"), "NEED_DECISION"
+        )
+        self.assertEqual(
+            relay.goal_signal("正文讨论 GOAL_DONE 的语义\n仍在执行"), "RUNNING"
+        )
+
+    def test_goal_prompt_keeps_only_boundary_and_terminal_contract(self):
         prompt = relay.goal_prompt("完成项目")
-        for value in ("GOAL_DONE", "NEED_DECISION", "NEW_WINDOW", "完成项目"):
+        for value in ("目标：完成项目", "边界：", "终态：", "GOAL_DONE", "NEED_DECISION", "NEW_WINDOW"):
             self.assertIn(value, prompt)
-        self.assertIn("普通进度只在当前 Claude TUI 展示", prompt)
-        self.assertIn("约 60%", prompt)
-        self.assertIn("超过 70%", prompt)
-        self.assertIn("配置可用时不要询问", prompt)
-        self.assertIn("临时工执行 + Claude 审核 + 预期返工", prompt)
+        self.assertIn("自主规划", prompt)
+        self.assertIn("普通进度留在当前 Claude TUI", prompt)
+        self.assertNotIn("约 60%", prompt)
+        self.assertNotIn("预期返工", prompt)
 
     def test_turn_prompt_loads_butler_only_when_requested(self):
         initial = relay.turn_prompt("任务", "marker", load_butler=True)
@@ -55,18 +72,53 @@ class RelayTest(unittest.TestCase):
         self.assertTrue(continued.startswith("继续"))
         self.assertNotIn("/butler", continued)
 
+    def test_screen_text_chunks_preserve_utf8_within_byte_limit(self):
+        text = "中文任务" * 80 + "ascii"
+        chunks = relay.screen_text_chunks(text, max_bytes=40)
+        self.assertEqual("".join(chunks), text)
+        self.assertTrue(all(len(chunk.encode("utf-8")) <= 40 for chunk in chunks))
+
     @patch("relay.wait_for_native_reply", return_value="完成")
-    @patch("relay.time.sleep")
-    @patch("relay._screen_command")
-    def test_native_turn_allows_tui_to_consume_text_before_enter(
-        self, screen_command, sleep, wait_reply
+    @patch("relay.deliver_native_prompt")
+    def test_native_turn_confirms_delivery_before_waiting_for_reply(
+        self, deliver_prompt, wait_reply
     ):
         relay.send_native_turn(
             "screen-one", "session-one", "任务", load_butler=False
         )
-        self.assertEqual(screen_command.call_count, 2)
-        sleep.assert_called_once_with(0.1)
-        self.assertEqual(screen_command.call_args_list[1].args[-1], "\r")
+        deliver_prompt.assert_called_once()
+        args = deliver_prompt.call_args.args
+        self.assertEqual(args[:2], ("screen-one", "session-one"))
+        self.assertIn("任务", args[2])
+        self.assertIn("relay-marker", args[3])
+
+    @patch("relay.DELIVERY_CHECKS", 1)
+    @patch("relay.native_screen_snapshot", return_value="")
+    @patch("relay.screen_is_alive", return_value=True)
+    @patch("relay.native_request_seen", side_effect=[False, False, True])
+    @patch("relay.time.sleep")
+    @patch("relay.stuff_native_text")
+    @patch("relay._screen_command")
+    def test_delivery_retypes_only_after_enter_retry_fails(
+        self, screen_command, stuff_text, sleep, request_seen, alive, snapshot
+    ):
+        relay.deliver_native_prompt("screen", "session", "PROMPT", "MARKER")
+        self.assertEqual(stuff_text.call_count, 2)
+        payloads = [call.args[-1] for call in screen_command.call_args_list]
+        self.assertEqual(payloads, ["\r", "\r", "\r"])
+
+    @patch("relay.DELIVERY_CHECKS", 1)
+    @patch("relay.native_screen_snapshot", return_value="MARKER")
+    @patch("relay.screen_is_alive", return_value=True)
+    @patch("relay.native_request_seen", return_value=False)
+    @patch("relay.time.sleep")
+    @patch("relay.stuff_native_text")
+    @patch("relay._screen_command")
+    def test_delivery_fails_instead_of_waiting_forever(
+        self, screen_command, stuff_text, sleep, request_seen, alive, snapshot
+    ):
+        with self.assertRaisesRegex(RuntimeError, "3 次"):
+            relay.deliver_native_prompt("screen", "session", "PROMPT", "MARKER")
 
     @patch("relay.time.sleep")
     @patch("relay.subprocess.Popen")
@@ -87,7 +139,8 @@ class RelayTest(unittest.TestCase):
         self.assertIn("-l", start_screen.call_args.args)
         launch_calls = [str(call.args) for call in screen_command.call_args_list]
         self.assertTrue(any("--session-id" in call for call in launch_calls))
-        self.assertFalse(any("--permission-mode" in call for call in launch_calls))
+        self.assertTrue(any("--permission-mode auto" in call for call in launch_calls))
+        self.assertFalse(any("bypassPermissions" in call for call in launch_calls))
         send_turn.assert_called_once_with(
             screen_name, session_id, "执行任务", load_butler=True
         )

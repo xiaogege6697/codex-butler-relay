@@ -1,67 +1,111 @@
 # Codex 自动管家接力器
 
-简称“管家接力器”或“接力器”。它实现一个轻量、跨模型的 Goal Loop：Codex 负责规划、关键决策与真实验收；前台 Claude Code 负责项目管理、执行与审核；Butler 只在经济上划算且结果可验证时，把非核心工作派给可用的低成本临时工模型。
+一个轻量、跨模型的 Goal Loop：用户只向 Codex 说明目标，Codex 把目标交给前台 Claude Code；Claude 加载 Butler 后自主执行，必要时调用低成本临时工模型；完成后 Codex 只做最终验收。
 
-## 核心功能
+它解决的不是“如何让模型遵守更多流程”，而是“如何用最少的协调成本，让不同价位模型完成同一个项目”。
 
-1. 转发续接：Codex 把任务文本发送给 Claude，同一项目自动续接原 session。
-2. 状态监测：查看 session、screen 及前台附着状态，不给长任务设置时间上限。
-3. 保存换窗：Claude 回复首行 `NEW_WINDOW` 时，接力器把交接内容发送到新 session，并关闭被替换的接力器 screen。
-4. Goal 闭环：`GOAL_DONE` 后由 Codex 验收，`NEED_DECISION` 交回 Codex，验收通过后标记 `accepted`。
+## 为什么这样设计
+
+大模型已经能拆任务、选工具和处理普通异常。把这些能力重新写成几十条检查点，会产生四种反效果：
+
+- 初始 Goal 过长，真正目标被流程文本淹没。
+- Claude 为证明合规而强制拆分、派发和汇报。
+- Codex 反复轮询、审批和转述进度，浪费高价值上下文。
+- 多层转述增加延迟，并让事实、字段和数值逐步失真。
+
+因此本项目只硬约束机器无法靠默契解决的接口：
+
+1. **目标**：要完成什么。
+2. **边界**：用户明确的权限、禁区和验收标准。
+3. **终态**：`GOAL_DONE`、`NEED_DECISION`、`NEW_WINDOW`。
+
+任务拆分、工具选择、模型路由和过程节奏交给 Claude 自主判断。临时工不是 KPI：只有经济上划算且结果可验证时才调用。
+
+## 最小工作流
+
+```mermaid
+flowchart LR
+    U[用户一句话目标] --> C[Codex 明确目标与边界]
+    C --> R[Relay 一次投递]
+    R --> B[Claude + Butler 自主执行]
+    B -->|适合时| W[低成本临时工]
+    W --> B
+    B -->|GOAL_DONE| V[Codex 真实验收]
+    B -->|NEED_DECISION| C
+    B -->|NEW_WINDOW| R
+    V --> O[交付成果]
+```
+
+理想状态下，Codex 只高强度工作两次：开始时把目标讲清楚，结束时验证成果。执行过程留在可见的 Claude TUI 中。
+
+## 核心能力
+
+- **前台真实交互**：启动 Terminal 中可见、可观察的 Claude Code TUI，不使用 `-p` 模拟交互。
+- **自动转发与续接**：新 Goal 新建 session；后续任务续接同一 session，避免重复加载 Butler。
+- **自动处理常规阻塞**：识别首次目录信任提示，使用 Claude `auto` permission mode 处理项目内常规操作。
+- **可靠长文本投递**：按 UTF-8 字节安全分块，并以 transcript marker 确认消息确实送达。
+- **事件式返回**：普通进度不回流 Codex；只在完成、关键决策或换窗时返回。
+- **安全换窗**：context 质量下降时自动携带交接信息开启新窗口，并关闭被替换的 Relay screen。
+- **不限运行时间**：大项目耗时长是正常现象；进程健康时不以时间判失败。
 
 ## 安装
 
 要求：macOS、Python 3.10+、Claude Code、GNU screen，以及 Claude 中可用的 `/butler` Skill。
 
 ```bash
-python3 -m pip install --user .
+git clone https://github.com/xiaogege6697/codex-butler-relay.git
+cd codex-butler-relay
+uv tool install .
 butler-relay --check
 ```
 
-`--check` 会检查 macOS、Python、Claude Code 与 GNU screen 版本、Terminal、Claude transcript 目录及 `/butler` Skill。长任务没有时间上限；只有 Claude/screen 已退出，或本轮明确结束但无法匹配回复时，接力器才会报错停止等待。
+将仓库中的 `skills/butler-relay` 安装到 Codex Skills 后，可以直接说：
 
-Claude 首次进入某个项目目录时，接力器会识别目录信任提示，并在默认选中“信任此目录”时自动确认，然后继续加载真实 TUI。
-
-将 `skills/butler-relay` 安装到 Codex Skills 后，可以直接说“打开接力器，把这个任务交给 Claude”。
+> 打开接力器，把这个任务交给 Claude，做好后直接给我成果。
 
 ## 使用
 
 ```bash
-# 启动新 Goal：自动新开并显示真实 Claude TUI
-butler-relay --goal --project /path/to/project "目标与验收标准"
+# 启动新 Goal，并打开真实 Claude TUI
+butler-relay --goal --project /path/to/project "目标、边界与验收标准"
 
-# 继续同一项目的 Claude（不会再次加载 /butler）
+# 续接当前项目
 butler-relay --project /path/to/project "下一阶段任务"
 
-# 查看状态
+# 仅在用户明确查询或已有故障证据时查看状态
 butler-relay --status --project /path/to/project
 
-# Codex 验收通过
+# Codex 真实验收通过后标记完成
 butler-relay --accept --project /path/to/project
 
-# 显式后台模式
+# 用户明确要求后台运行时才使用
 butler-relay --headless --project /path/to/project "任务文本"
 ```
 
-项目状态只写入目标项目根目录的 `.butler-relay.json`。Claude transcript 仍由 Claude Code 自己管理。
+状态只写入目标项目根目录的 `.butler-relay.json`。Claude transcript 仍由 Claude Code 自己管理。
 
-## 工作流原则
+## 三个终态信号
 
-- Codex 负责目标、关键决策和最终验收；Claude 负责拆分、项目执行与初审。
-- 临时工不限模型。只有“临时工执行 + Claude 审核 + 预期返工”比 Claude 直接完成更便宜，且结果可验证时才外包。
-- 接力器只负责流程连接，不复制模型配置，不替模型设计复杂状态机。
-- 默认前台可见；普通进度留在 Claude TUI，只有 `GOAL_DONE`、`NEED_DECISION`、`NEW_WINDOW` 回到 Codex。
-- 新 session 按手动方式启动 Claude TUI 并加载一次 `/butler`；同 session 续接只转发文本，权限沿用 Claude 本地配置。
+| 信号 | 含义 | 后续动作 |
+|---|---|---|
+| `GOAL_DONE` | Claude 认为目标已完成 | Codex 检查真实文件、测试和用户可见结果 |
+| `NEED_DECISION` | 存在无法自行决定的关键取舍 | Codex 决策；只有真正影响用户意图时才询问用户 |
+| `NEW_WINDOW` | context 已开始影响质量 | Relay 把完整交接内容发送到新 Claude session |
 
 ## 设计边界
 
-接力器不做模型路由、任务拆分、数据库、Dashboard 或复杂状态机。跨模型能力来自 Codex、Claude 与可替换临时工的协作协议，而不是在 Relay 内堆 provider adapter。
+Relay 不做任务拆分、模型路由、数据库、Dashboard、成本报表或复杂状态机。它只负责：启动、投递、续接、等待终态和换窗。
 
-## 测试
+Claude 与 Butler 负责执行策略；临时工可以是 MiMo、DeepSeek 或任何可用且便宜的模型。Codex 不在线“盯过程”，而是拥有目标与最终裁决权。
+
+## 验证
 
 ```bash
-python3 -m unittest -v tests/test_relay.py
+python3 -m unittest -v
+butler-relay --check
 ```
+
+当前版本已通过真实前台 Goal：4 次模型轮次、6 次必要工具调用，无临时工、Agent、审批或 Codex 状态轮询。这个结果也说明：**轻任务不应为了展示多模型协作而强制外包。**
 
 ## License
 

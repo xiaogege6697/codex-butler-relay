@@ -1,4 +1,4 @@
 interface:
   display_name: "管家接力器"
-  short_description: "让 Codex 规划验收并盯着前台 Claude 完成目标"
-  default_prompt: "使用 $butler-relay 把我的一句话目标交给前台 Claude/Butler；普通进度留在 TUI，只在关键节点接手，并在真实验收后直接给我成果。"
+  short_description: "连接前台 Claude，自主执行并在终态交回 Codex"
+  default_prompt: "使用 $butler-relay 把我的一句话目标交给前台 Claude/Butler；让 Claude 自主执行，普通进度留在 TUI，只在关键终态接手，并在真实验收后直接给我成果。"
