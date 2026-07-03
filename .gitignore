@@ -12,3 +12,8 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# 本地生成的文档与中间资产（保留文件，不提交源码仓库）
+diagram/
+output/
+tmp/
