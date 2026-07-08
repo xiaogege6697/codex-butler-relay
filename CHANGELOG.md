@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 - 2026-07-09
+
+### 文档
+
+- 新增 `docs/relay-contract.md`，明确 Relay 的稳定输入、状态文件、Goal 状态、终态信号、heartbeat 和故障恢复契约。
+- 新增 `evals/evals.json`，覆盖 Goal Loop、静默 `--collect`、退避、换窗、协议错误和不强制临时工等回归场景。
+- README 增加维护契约和验证层级说明，方便接入者判断哪些部分可替换、哪些契约不能破坏。
+
 ## 0.3.0 - 2026-07-03
 
 ### 新功能

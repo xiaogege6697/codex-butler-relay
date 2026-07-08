@@ -1,0 +1,67 @@
+{
+  "version": "0.1.0",
+  "project": "codex-butler-relay",
+  "purpose": "验证 Relay 是否守住轻量 Goal Loop 的稳定契约，而不是退化为重型调度器或普通轮询脚本。",
+  "evals": [
+    {
+      "id": "new_goal_wraps_minimal_contract",
+      "mode": "unit",
+      "given": "用户用 --goal 启动一个新任务",
+      "expect": "发送给 Claude 的文本只包含目标、边界和 GOAL_DONE/NEED_DECISION/NEW_WINDOW 终态契约，不展开任务拆分、路由或进度模板。"
+    },
+    {
+      "id": "continuation_reuses_session",
+      "mode": "unit",
+      "given": "同一个项目已有 session_id，用户发送下一阶段任务",
+      "expect": "Relay 续接原 Claude session，且不重复注入 /butler。"
+    },
+    {
+      "id": "terminal_signal_not_mentioned_text",
+      "mode": "unit",
+      "given": "Claude 正文中讨论 GOAL_DONE 的含义，但没有按终态格式返回",
+      "expect": "goal_signal 返回 RUNNING，避免把普通正文误判为完成。"
+    },
+    {
+      "id": "detached_collect_is_silent",
+      "mode": "behavior",
+      "given": "detached worker 仍在执行，状态为 running",
+      "expect": "--collect 只返回 GOAL_RUNNING 和 NEXT_CHECK_MINUTES，不读取项目文件、不检查 screen、不生成普通进度播报。"
+    },
+    {
+      "id": "poll_interval_doubles",
+      "mode": "unit",
+      "given": "连续两次 --collect 未拿到 result_path",
+      "expect": "poll_interval_minutes 从 10 变为 20，再变为 40。"
+    },
+    {
+      "id": "goal_done_requires_codex_acceptance",
+      "mode": "behavior",
+      "given": "Claude 返回 GOAL_DONE",
+      "expect": "Relay 状态变为 awaiting_acceptance；只有 Codex 验证后执行 --accept，状态才变为 accepted。"
+    },
+    {
+      "id": "new_window_handoff_replaces_managed_screen_only",
+      "mode": "unit",
+      "given": "Claude 返回 NEW_WINDOW 且旧 screen 名为 butler-native-*",
+      "expect": "Relay 用交接内容启动新 session，并只关闭自己管理的旧 screen。"
+    },
+    {
+      "id": "protocol_error_is_visible",
+      "mode": "behavior",
+      "given": "Claude 结束回复但没有终态信号",
+      "expect": "Relay 进入 protocol_error 或抛出明确错误，Codex 可据此发送纠正指令，不把结果当成功。"
+    },
+    {
+      "id": "environment_check_is_diagnostic_only",
+      "mode": "behavior",
+      "given": "用户已经正常启动 Goal Loop",
+      "expect": "Skill 不在每次任务前运行 --check；只有首次安装或已有环境失败证据时才使用。"
+    },
+    {
+      "id": "no_forced_worker_delegation",
+      "mode": "policy",
+      "given": "任务很轻，Claude 可直接完成",
+      "expect": "Relay 和 Skill 不要求调用 MiMo、DeepSeek 或其他临时工来证明多模型协作。"
+    }
+  ]
+}

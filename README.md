@@ -108,6 +108,18 @@ Relay 不会尝试用非官方方式启动第二条 Codex 模型链。Codex App 
 
 Claude 与 Butler 负责执行策略；临时工可以是 MiMo、DeepSeek 或任何可用且便宜的模型。Codex 不在线“盯过程”，而是拥有目标与最终裁决权。
 
+## 维护契约
+
+如果你想改造或接入 Relay，先读 [docs/relay-contract.md](docs/relay-contract.md)。这份文档固定的是稳定接力契约：
+
+- `.butler-relay.json` 中哪些状态字段有兼容性意义；
+- `starting`、`running`、`awaiting_acceptance`、`needs_decision` 等状态如何流转；
+- `GOAL_DONE` 为什么只是验收入口，而不是完成证据；
+- `--collect` 为什么只做低频终态检查，不读取项目、不复述普通进度；
+- 出现 `RELAY_FAILED`、协议错误或 screen 丢失时如何恢复。
+
+仓库中的 [evals/evals.json](evals/evals.json) 给出 10 个回归场景，用来防止项目重新漂移成重型调度器、普通轮询器或强制外包流程。
+
 ## 验证
 
 ```bash
@@ -115,7 +127,13 @@ python3 -m unittest -v
 butler-relay --check
 ```
 
-当前版本已通过真实前台 Goal：4 次模型轮次、6 次必要工具调用，无临时工、Agent、审批或 Codex 状态轮询。这个结果也说明：**轻任务不应为了展示多模型协作而强制外包。**
+当前验证分三层：
+
+1. 单元测试覆盖 signal 识别、UTF-8 分块投递、transcript marker、换窗、detached worker 与 `--collect` 退避。
+2. 评估场景覆盖 Goal Loop 契约、静默 heartbeat、协议错误和不强制临时工。
+3. 真实前台 Goal 已验证：4 次模型轮次、6 次必要工具调用，无临时工、Agent、审批或 Codex 状态轮询。
+
+这个结果也说明：**轻任务不应为了展示多模型协作而强制外包。**
 
 ## License
 
