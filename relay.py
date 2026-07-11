@@ -25,6 +25,11 @@ TRANSCRIPT_ROOT = Path(
 )
 CACHE_DIR = Path.home() / ".cache" / "codex-butler-relay"
 SIGNALS = {"GOAL_DONE", "NEED_DECISION", "NEW_WINDOW"}
+TERMINAL_SIGNALS = SIGNALS | {"RELAY_FAILED", "PROTOCOL_ERROR"}
+GOAL_PROTOCOL = "goal-capsule-v1"
+EVENT_PROTOCOL = "butler-event-v1"
+FIRST_WATCHDOG_MINUTES = 360
+NEXT_WATCHDOG_MINUTES = 1440
 DELIVERY_ATTEMPTS = 3
 DELIVERY_CHECKS = 20
 SCREEN_STUFF_MAX_BYTES = 160
@@ -68,15 +73,78 @@ def project_cache_dir(project: Path) -> Path:
 
 def write_detached_result(path: Path, result: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(result, encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(result, encoding="utf-8")
+    temporary.replace(path)
+
+
+def write_terminal_event(
+    path: Path,
+    *,
+    goal_id: str,
+    signal: str,
+    project: Path,
+    result_path: Path,
+) -> dict[str, str]:
+    """原子写入最小终态事件；详细内容留在 result_path，避免重复传递。"""
+    if signal not in TERMINAL_SIGNALS:
+        raise ValueError(f"非终态信号不能写入事件：{signal}")
+    digest = hashlib.sha256(result_path.read_bytes()).hexdigest()
+    event = {
+        "protocol": EVENT_PROTOCOL,
+        "goal_id": goal_id,
+        "signal": signal,
+        "project": str(project),
+        "result_path": str(result_path),
+        "sha256": digest,
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(
+        json.dumps(event, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)
+    return event
+
+
+def format_terminal_event(event: dict[str, str]) -> str:
+    return f"{event['signal']}\n{EVENT_PROTOCOL}\n{json.dumps(event, ensure_ascii=False)}"
+
+
+def validate_terminal_event(
+    event: object, *, state: dict[str, str], project: Path
+) -> tuple[dict[str, str] | None, str | None]:
+    if not isinstance(event, dict) or event.get("protocol") != EVENT_PROTOCOL:
+        return None, "终态事件协议无效"
+    required = {"goal_id", "signal", "project", "result_path", "sha256"}
+    if not required.issubset(event) or not all(
+        isinstance(event[key], str) and event[key] for key in required
+    ):
+        return None, "终态事件字段不完整"
+    if event["signal"] not in TERMINAL_SIGNALS:
+        return None, "终态事件 signal 无效"
+    if state.get("goal_id") and event["goal_id"] != state["goal_id"]:
+        return None, "终态事件 goal_id 与当前任务不一致"
+    if Path(event["project"]).resolve() != project.resolve():
+        return None, "终态事件项目路径不一致"
+    if state.get("result_path") and event["result_path"] != state["result_path"]:
+        return None, "终态事件结果路径与当前任务不一致"
+    result_path = Path(event["result_path"])
+    if not result_path.is_file():
+        return None, "终态结果文件不存在"
+    actual_digest = hashlib.sha256(result_path.read_bytes()).hexdigest()
+    if actual_digest != event["sha256"]:
+        return None, "终态结果摘要校验失败"
+    return {key: str(value) for key, value in event.items()}, None
 
 
 def notify_terminal(signal: str, project: Path) -> None:
     messages = {
-        "GOAL_DONE": "Claude 已完成；Codex 将在下一次低频检查时验收",
-        "NEED_DECISION": "Claude 需要关键决策；Codex 将在下一次检查时接手",
-        "PROTOCOL_ERROR": "Claude 已返回但缺少终态；Codex 将在下一次检查时处理",
-        "ERROR": "接力任务异常退出；Codex 将在下一次检查时处理",
+        "GOAL_DONE": "Claude 已完成；终态事件已写入，等待 Codex 验收",
+        "NEED_DECISION": "Claude 需要关键决策；终态事件已写入",
+        "PROTOCOL_ERROR": "Claude 已返回但缺少终态；错误事件已写入",
+        "RELAY_FAILED": "接力任务异常退出；错误事件已写入",
     }
     body = messages.get(signal)
     if not body or not shutil.which("osascript"):
@@ -109,14 +177,23 @@ def goal_signal(text: str) -> str:
     return "RUNNING"
 
 
-def goal_prompt(text: str) -> str:
+def goal_prompt(
+    text: str, *, goal_id: str = "", project: Path | None = None
+) -> str:
+    goal_id = goal_id or "unspecified"
+    project_anchor = str(project) if project else "当前项目目录"
     return (
-        f"目标：{text}\n"
-        "边界：你拥有项目内完整执行权限；加载 Butler 后自主规划、选工具并决定是否调用"
-        "低成本临时工，关键判断与最终审核由你负责。仅在依赖失效、额度异常或确需用户"
-        "关键决策时暂停。\n"
-        "终态：完成首行 GOAL_DONE；需决策首行 NEED_DECISION；context 质量下降需换窗首行"
-        " NEW_WINDOW 并附完整交接。普通进度留在当前 Claude TUI，不要结束本轮。"
+        f"[{GOAL_PROTOCOL}]\n"
+        f"goal_id: {goal_id}\n"
+        f"intent_and_outcome: {text}\n"
+        "boundaries: 仅在用户明确授权的项目范围和边界内执行；未授权的外部写入、删除、"
+        "发布和敏感操作必须暂停。\n"
+        "acceptance: 以用户给出的验收标准和真实可复核证据为准；不得用自述代替验证。\n"
+        f"anchors: project={project_anchor}; 优先读取项目内权威文件，不复制无关上下文。\n"
+        "execution: 加载 Butler 后自主规划、选工具并决定是否调用低成本临时工；普通过程"
+        "不回传 Codex。\n"
+        "terminal: 完成首行 GOAL_DONE；需决策首行 NEED_DECISION；context 质量下降首行"
+        " NEW_WINDOW 并附完整交接。"
     )
 
 
@@ -138,15 +215,23 @@ def _screen_command(*parts: str, check: bool = True) -> subprocess.CompletedProc
 
 
 def _start_screen(project: Path, *parts: str) -> None:
-    subprocess.Popen(
-        [SCREEN, "-DmS", *parts],
+    completed = subprocess.run(
+        [SCREEN, "-dmS", *parts],
         cwd=project,
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    time.sleep(0.2)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(f"screen 启动失败：{detail or completed.returncode}")
+    screen_name = parts[0] if parts else ""
+    for _ in range(20):
+        if screen_name and screen_is_alive(screen_name):
+            return
+        time.sleep(0.05)
+    raise RuntimeError(f"screen 启动后未保持存活：{screen_name}")
 
 
 def screen_status(name: str) -> str | None:
@@ -178,7 +263,17 @@ def open_native_terminal(screen_name: str) -> None:
     command = f"{shlex.quote(SCREEN)} -x {shlex.quote(screen_name)}"
     escaped = command.replace("\\", "\\\\").replace('"', '\\"')
     apple_script = f'tell application "Terminal" to do script "{escaped}"'
-    subprocess.run(["osascript", "-e", apple_script], check=True, capture_output=True)
+    completed = subprocess.run(
+        ["osascript", "-e", apple_script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(
+            f"Terminal 无法附着 screen {screen_name}：{detail or completed.returncode}"
+        )
 
 
 def native_screen_snapshot(screen_name: str) -> str:
@@ -572,10 +667,12 @@ def start_detached(
     headless: bool,
 ) -> dict[str, str]:
     job_id = str(uuid.uuid4())
+    goal_id = job_id if goal else load_state(project).get("goal_id") or job_id
     cache = project_cache_dir(project)
     cache.mkdir(parents=True, exist_ok=True)
     job_path = cache / f"job-{job_id}.json"
     result_path = cache / f"result-{job_id}.md"
+    event_path = cache / f"event-{job_id}.json"
     log_path = cache / f"worker-{job_id}.log"
     job_path.write_text(
         json.dumps(
@@ -585,7 +682,9 @@ def start_detached(
                 "goal": goal,
                 "force_new": force_new,
                 "headless": headless,
+                "goal_id": goal_id,
                 "result_path": str(result_path),
+                "event_path": str(event_path),
             },
             ensure_ascii=False,
             indent=2,
@@ -596,10 +695,12 @@ def start_detached(
         update_state(
             project,
             goal=text,
+            goal_id=goal_id,
             goal_status="starting",
             last_signal="GOAL_STARTED",
-            poll_interval_minutes="10",
+            watchdog_minutes=str(FIRST_WATCHDOG_MINUTES),
             result_path=str(result_path),
+            event_path=str(event_path),
             log_path=str(log_path),
         )
     elif load_state(project).get("goal"):
@@ -607,8 +708,9 @@ def start_detached(
             project,
             goal_status="starting",
             last_signal="CONTINUING",
-            poll_interval_minutes="10",
+            watchdog_minutes=str(FIRST_WATCHDOG_MINUTES),
             result_path=str(result_path),
+            event_path=str(event_path),
             log_path=str(log_path),
         )
     command = [sys.executable, str(Path(__file__).resolve()), "--worker", str(job_path)]
@@ -623,7 +725,10 @@ def start_detached(
         )
     return {
         "signal": "GOAL_STARTED",
+        "goal_id": goal_id,
         "project": str(project),
+        "event_path": str(event_path),
+        "watchdog_minutes": str(FIRST_WATCHDOG_MINUTES),
         "worker_pid": str(process.pid),
     }
 
@@ -633,9 +738,17 @@ def run_detached_job(job_path: Path) -> int:
         job = json.loads(job_path.read_text(encoding="utf-8"))
         project = Path(job["project"]).resolve()
         result_path = Path(job["result_path"])
+        event_path = Path(
+            job.get("event_path") or result_path.with_suffix(".event.json")
+        )
+        goal_id = str(job.get("goal_id") or uuid.uuid4())
         raw_text = str(job["text"])
         is_goal = bool(job["goal"])
-        text = goal_prompt(raw_text) if is_goal else raw_text
+        text = (
+            goal_prompt(raw_text, goal_id=goal_id, project=project)
+            if is_goal
+            else raw_text
+        )
         if is_goal:
             update_state(project, goal=raw_text, goal_status="running", last_signal="STARTED")
         elif load_state(project).get("goal"):
@@ -643,14 +756,26 @@ def run_detached_job(job_path: Path) -> int:
         relay = relay_headless if bool(job["headless"]) else relay_native
         result = relay(project, text, force_new=bool(job["force_new"]) or is_goal)
         write_detached_result(result_path, result)
-        update_goal_from_result(project, result)
         signal = goal_signal(result)
         if signal == "RUNNING":
-            update_state(project, goal_status="protocol_error", last_signal="PROTOCOL_ERROR")
             signal = "PROTOCOL_ERROR"
+        write_terminal_event(
+            event_path,
+            goal_id=goal_id,
+            signal=signal,
+            project=project,
+            result_path=result_path,
+        )
+        if signal == "PROTOCOL_ERROR":
+            update_state(
+                project, goal_status="protocol_error", last_signal=signal
+            )
+        else:
+            update_goal_from_result(project, result)
         update_state(
             project,
             result_path=str(result_path),
+            event_path=str(event_path),
             finished_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         )
         notify_terminal(signal, project)
@@ -661,31 +786,47 @@ def run_detached_job(job_path: Path) -> int:
         if isinstance(project_value, Path):
             if isinstance(result_value, Path):
                 write_detached_result(result_value, f"RELAY_FAILED\n{exc}")
+                event_value = locals().get("event_path")
+                goal_value = str(locals().get("goal_id") or "unknown")
+                if isinstance(event_value, Path):
+                    write_terminal_event(
+                        event_value,
+                        goal_id=goal_value,
+                        signal="RELAY_FAILED",
+                        project=project_value,
+                        result_path=result_value,
+                    )
             update_state(
                 project_value,
                 goal_status="failed",
-                last_signal="ERROR",
+                last_signal="RELAY_FAILED",
                 finished_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             )
-            notify_terminal("ERROR", project_value)
+            notify_terminal("RELAY_FAILED", project_value)
         print(str(exc), file=sys.stderr)
         return 1
 
 
 def collect_result(project: Path) -> tuple[str, int]:
     state = load_state(project)
+    event_path = state.get("event_path")
+    if event_path and Path(event_path).is_file():
+        try:
+            event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "RELAY_FAILED\n终态事件无法解析", 1
+        validated, error = validate_terminal_event(
+            event, state=state, project=project
+        )
+        if error:
+            return f"RELAY_FAILED\n{error}", 1
+        return format_terminal_event(validated or {}), 0
     result_path = state.get("result_path")
-    if result_path and Path(result_path).is_file():
+    if not event_path and result_path and Path(result_path).is_file():
         return Path(result_path).read_text(encoding="utf-8"), 0
     status = state.get("goal_status")
     if status in {"starting", "running", "switching_window"}:
-        try:
-            current = max(1, int(state.get("poll_interval_minutes", "10")))
-        except ValueError:
-            current = 10
-        next_interval = current * 2
-        update_state(project, poll_interval_minutes=str(next_interval))
-        return f"GOAL_RUNNING\nNEXT_CHECK_MINUTES={next_interval}", 0
+        return f"GOAL_RUNNING\nNEXT_WATCHDOG_MINUTES={NEXT_WATCHDOG_MINUTES}", 0
     if status == "accepted":
         return "GOAL_ACCEPTED", 0
     return "NO_RESULT", 1
@@ -745,8 +886,15 @@ def main() -> int:
         print(json.dumps(started, ensure_ascii=False))
         return 0
     if args.goal:
-        update_state(project, goal=text, goal_status="running", last_signal="STARTED")
-        text = goal_prompt(text)
+        goal_id = str(uuid.uuid4())
+        update_state(
+            project,
+            goal=text,
+            goal_id=goal_id,
+            goal_status="running",
+            last_signal="STARTED",
+        )
+        text = goal_prompt(text, goal_id=goal_id, project=project)
     elif load_state(project).get("goal"):
         update_state(project, goal_status="running", last_signal="CONTINUED")
 

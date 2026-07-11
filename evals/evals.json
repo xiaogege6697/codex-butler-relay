@@ -1,5 +1,5 @@
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "project": "codex-butler-relay",
   "purpose": "验证 Relay 是否守住轻量 Goal Loop 的稳定契约，而不是退化为重型调度器或普通轮询脚本。",
   "evals": [
@@ -7,7 +7,7 @@
       "id": "new_goal_wraps_minimal_contract",
       "mode": "unit",
       "given": "用户用 --goal 启动一个新任务",
-      "expect": "发送给 Claude 的文本只包含目标、边界和 GOAL_DONE/NEED_DECISION/NEW_WINDOW 终态契约，不展开任务拆分、路由或进度模板。"
+      "expect": "发送给Claude的goal-capsule-v1只包含目标、边界、验收、项目锚点和终态契约，不展开任务拆分、路由或进度模板。"
     },
     {
       "id": "continuation_reuses_session",
@@ -22,16 +22,22 @@
       "expect": "goal_signal 返回 RUNNING，避免把普通正文误判为完成。"
     },
     {
-      "id": "detached_collect_is_silent",
+      "id": "detached_runtime_is_event_first",
       "mode": "behavior",
       "given": "detached worker 仍在执行，状态为 running",
-      "expect": "--collect 只返回 GOAL_RUNNING 和 NEXT_CHECK_MINUTES，不读取项目文件、不检查 screen、不生成普通进度播报。"
+      "expect": "正常运行期间不调用Codex；只有用户返回或远期watchdog时，--collect才返回GOAL_RUNNING和NEXT_WATCHDOG_MINUTES。"
     },
     {
-      "id": "poll_interval_doubles",
+      "id": "running_collect_is_idempotent",
       "mode": "unit",
-      "given": "连续两次 --collect 未拿到 result_path",
-      "expect": "poll_interval_minutes 从 10 变为 20，再变为 40。"
+      "given": "连续两次--collect尚未拿到终态事件",
+      "expect": "两次都返回NEXT_WATCHDOG_MINUTES=1440，状态不会因重复调用继续放大间隔。"
+    },
+    {
+      "id": "terminal_event_is_minimal_and_verifiable",
+      "mode": "unit",
+      "given": "Claude返回终态",
+      "expect": "Relay原子写butler-event-v1，只含goal_id、signal、结果指针和SHA-256；collect拒绝串线、缺失或摘要不一致的结果。"
     },
     {
       "id": "goal_done_requires_codex_acceptance",

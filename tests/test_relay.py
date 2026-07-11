@@ -57,13 +57,68 @@ class RelayTest(unittest.TestCase):
         )
 
     def test_goal_prompt_keeps_only_boundary_and_terminal_contract(self):
-        prompt = relay.goal_prompt("完成项目")
-        for value in ("目标：完成项目", "边界：", "终态：", "GOAL_DONE", "NEED_DECISION", "NEW_WINDOW"):
+        prompt = relay.goal_prompt(
+            "完成项目", goal_id="goal-1", project=self.project
+        )
+        for value in (
+            "[goal-capsule-v1]",
+            "goal_id: goal-1",
+            "intent_and_outcome: 完成项目",
+            "boundaries:",
+            "acceptance:",
+            "anchors:",
+            "GOAL_DONE",
+            "NEED_DECISION",
+            "NEW_WINDOW",
+        ):
             self.assertIn(value, prompt)
         self.assertIn("自主规划", prompt)
-        self.assertIn("普通进度留在当前 Claude TUI", prompt)
+        self.assertIn("普通过程不回传 Codex", prompt)
+        self.assertIn("未授权", prompt)
+        self.assertNotIn("完整执行权限", prompt)
         self.assertNotIn("约 60%", prompt)
         self.assertNotIn("预期返工", prompt)
+
+    def test_terminal_event_is_minimal_and_verifiable(self):
+        result_path = self.project / "result.md"
+        event_path = self.project / "event.json"
+        relay.write_detached_result(result_path, "GOAL_DONE\n成果")
+        event = relay.write_terminal_event(
+            event_path,
+            goal_id="goal-1",
+            signal="GOAL_DONE",
+            project=self.project,
+            result_path=result_path,
+        )
+        self.assertEqual(event["protocol"], "butler-event-v1")
+        self.assertEqual(event["goal_id"], "goal-1")
+        self.assertEqual(event["signal"], "GOAL_DONE")
+        self.assertEqual(event["result_path"], str(result_path))
+        self.assertEqual(len(event["sha256"]), 64)
+        self.assertNotIn("成果", event_path.read_text(encoding="utf-8"))
+
+    def test_collect_rejects_tampered_terminal_result(self):
+        result_path = self.project / "result.md"
+        event_path = self.project / "event.json"
+        relay.write_detached_result(result_path, "GOAL_DONE\n成果")
+        relay.write_terminal_event(
+            event_path,
+            goal_id="goal-1",
+            signal="GOAL_DONE",
+            project=self.project,
+            result_path=result_path,
+        )
+        relay.update_state(
+            self.project,
+            goal_id="goal-1",
+            goal_status="awaiting_acceptance",
+            result_path=str(result_path),
+            event_path=str(event_path),
+        )
+        result_path.write_text("被修改", encoding="utf-8")
+        result, code = relay.collect_result(self.project)
+        self.assertEqual(code, 1)
+        self.assertEqual(result, "RELAY_FAILED\n终态结果摘要校验失败")
 
     def test_turn_prompt_loads_butler_only_when_requested(self):
         initial = relay.turn_prompt("任务", "marker", load_butler=True)
@@ -121,10 +176,21 @@ class RelayTest(unittest.TestCase):
             relay.deliver_native_prompt("screen", "session", "PROMPT", "MARKER")
 
     @patch("relay.time.sleep")
-    @patch("relay.subprocess.Popen")
-    def test_screen_launcher_does_not_wait_for_interactive_process(self, popen, sleep):
+    @patch("relay.screen_is_alive", return_value=True)
+    @patch("relay.subprocess.run")
+    def test_screen_launcher_uses_detached_daemon_mode(self, run, alive, sleep):
+        run.return_value.returncode = 0
         relay._start_screen(self.project, "screen-name", "/bin/zsh", "-l")
-        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(run.call_args.args[0][1], "-dmS")
+        alive.assert_called_once_with("screen-name")
+
+    @patch("relay.subprocess.run")
+    def test_terminal_attach_reports_real_stderr(self, run):
+        run.return_value.returncode = 1
+        run.return_value.stderr = "No screen session found"
+        run.return_value.stdout = ""
+        with self.assertRaisesRegex(RuntimeError, "No screen session found"):
+            relay.open_native_terminal("butler-native-test")
 
     @patch("relay.send_native_turn", return_value="完成")
     @patch("relay._screen_command")
@@ -381,15 +447,19 @@ class RelayTest(unittest.TestCase):
             )
         self.assertEqual(started["signal"], "GOAL_STARTED")
         self.assertEqual(started["worker_pid"], "4321")
+        self.assertTrue(started["goal_id"])
+        self.assertEqual(started["watchdog_minutes"], "360")
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         state = relay.load_state(self.project)
         self.assertEqual(state["goal_status"], "starting")
-        self.assertEqual(state["poll_interval_minutes"], "10")
+        self.assertEqual(state["watchdog_minutes"], "360")
+        self.assertEqual(state["goal_id"], started["goal_id"])
 
     @patch("relay.notify_terminal")
     @patch("relay.relay_native", return_value="GOAL_DONE\n成果")
     def test_detached_worker_persists_terminal_result(self, relay_native, notify):
         result_path = self.project / "result.md"
+        event_path = self.project / "event.json"
         job_path = self.project / "job.json"
         job_path.write_text(
             json.dumps(
@@ -399,7 +469,9 @@ class RelayTest(unittest.TestCase):
                     "goal": True,
                     "force_new": False,
                     "headless": False,
+                    "goal_id": "goal-1",
                     "result_path": str(result_path),
+                    "event_path": str(event_path),
                 }
             ),
             encoding="utf-8",
@@ -409,25 +481,56 @@ class RelayTest(unittest.TestCase):
         state = relay.load_state(self.project)
         self.assertEqual(state["goal_status"], "awaiting_acceptance")
         self.assertEqual(state["last_signal"], "GOAL_DONE")
+        event = json.loads(event_path.read_text(encoding="utf-8"))
+        self.assertEqual(event["protocol"], "butler-event-v1")
+        self.assertEqual(event["goal_id"], "goal-1")
+        self.assertEqual(event["signal"], "GOAL_DONE")
         notify.assert_called_once_with("GOAL_DONE", self.project.resolve())
 
-    def test_collect_reports_running_then_reads_result(self):
-        relay.update_state(
-            self.project, goal_status="running", poll_interval_minutes="10"
+    def test_collect_running_is_idempotent_then_reads_terminal_event(self):
+        relay.update_state(self.project, goal_status="running")
+        self.assertEqual(
+            relay.collect_result(self.project),
+            ("GOAL_RUNNING\nNEXT_WATCHDOG_MINUTES=1440", 0),
         )
         self.assertEqual(
             relay.collect_result(self.project),
-            ("GOAL_RUNNING\nNEXT_CHECK_MINUTES=20", 0),
-        )
-        self.assertEqual(
-            relay.collect_result(self.project),
-            ("GOAL_RUNNING\nNEXT_CHECK_MINUTES=40", 0),
+            ("GOAL_RUNNING\nNEXT_WATCHDOG_MINUTES=1440", 0),
         )
         result_path = self.project / "result.md"
-        result_path.write_text("GOAL_DONE\n成果", encoding="utf-8")
-        relay.update_state(self.project, result_path=str(result_path))
+        event_path = self.project / "event.json"
+        relay.write_detached_result(result_path, "GOAL_DONE\n成果")
+        relay.write_terminal_event(
+            event_path,
+            goal_id="goal-1",
+            signal="GOAL_DONE",
+            project=self.project,
+            result_path=result_path,
+        )
+        relay.update_state(
+            self.project,
+            result_path=str(result_path),
+            event_path=str(event_path),
+        )
+        collected, code = relay.collect_result(self.project)
+        self.assertEqual(code, 0)
+        self.assertTrue(collected.startswith("GOAL_DONE\nbutler-event-v1\n"))
+        self.assertIn('"goal_id": "goal-1"', collected)
+
+    def test_collect_never_bypasses_pending_event_with_raw_result(self):
+        result_path = self.project / "result.md"
+        event_path = self.project / "event.json"
+        relay.write_detached_result(result_path, "GOAL_DONE\n尚未封装事件")
+        relay.update_state(
+            self.project,
+            goal_id="goal-1",
+            goal_status="running",
+            result_path=str(result_path),
+            event_path=str(event_path),
+        )
         self.assertEqual(
-            relay.collect_result(self.project), ("GOAL_DONE\n成果", 0)
+            relay.collect_result(self.project),
+            ("GOAL_RUNNING\nNEXT_WATCHDOG_MINUTES=1440", 0),
         )
 
     @patch("relay.start_detached")
@@ -465,6 +568,8 @@ class RelayTest(unittest.TestCase):
         ):
             self.assertEqual(relay.main(), 0)
         sent_text = relay_native.call_args.args[1]
+        self.assertIn("[goal-capsule-v1]", sent_text)
+        self.assertIn("goal_id:", sent_text)
         self.assertIn("GOAL_DONE", sent_text)
         self.assertTrue(relay_native.call_args.kwargs["force_new"])
 

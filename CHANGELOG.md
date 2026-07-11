@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0 - 2026-07-11
+
+### 新功能
+
+- Codex → Claude 使用 `goal-capsule-v1`：只传目标、明确边界、验收标准和项目锚点，不下沉执行规划。
+- Relay 在终态原子写入 `butler-event-v1`，只传 `goal_id`、signal、结果路径与 SHA-256；完整结果继续留在 cache 文件。
+
+### 优化
+
+- 取消 10、20、40、80 分钟中间态轮询，改为首次 6 小时、后续 24 小时的远期 watchdog。
+- `--collect` 在运行态保持幂等，不再因重复调用不断放大检查间隔。
+- 收紧默认授权文案：Relay 不再宣称拥有项目内完整执行权限，只忠实遵守用户明确边界。
+
+### 修复
+
+- 修正macOS GNU screen启动参数：使用真正的detached daemon模式`-dmS`，并在screen未存活或Terminal附着失败时保留真实错误信息。
+
+### 边界
+
+- 当前 Codex App 未向独立 Relay 进程提供稳定 thread callback；终态即时写事件并发 macOS 通知，watchdog 只负责防止事件丢失，不使用 UI 自动化伪造回调。
+
 ## 0.3.1 - 2026-07-09
 
 ### 文档

@@ -24,7 +24,7 @@ Relay 接受两类输入：
 | 输入 | 来源 | 契约 |
 |---|---|---|
 | project | 当前工作目录或用户明确路径 | 必须是存在的目录；状态只写入该目录 |
-| text | 用户目标或下一阶段指令 | 原样传递；新 Goal 会包裹最小目标、边界和终态信号 |
+| text | 用户目标或下一阶段指令 | 新Goal包装为`goal-capsule-v1`，只包含目标、明确边界、验收标准、项目锚点和终态信号 |
 
 新 Goal 必须使用 `--goal`，它会启动新 session 并只在首次加载 `/butler`。后续续接不重复加载 Butler。
 
@@ -41,13 +41,15 @@ Relay 接受两类输入：
 | 字段 | 含义 | 谁写入 |
 |---|---|---|
 | goal | 原始用户目标 | `--goal` 或 detached worker |
+| goal_id | 当前Goal唯一身份 | `--goal` |
 | goal_status | 接力状态 | Relay |
 | last_signal | 最近一次识别到的信号 | Relay |
 | session_id | Claude session id | Relay |
 | screen_name | Relay 管理的 screen 名称 | Relay |
 | mode | `interactive` 或 `headless` | Relay |
-| poll_interval_minutes | 下一次 heartbeat 间隔 | `--collect` |
+| watchdog_minutes | 丢失终态事件时的远期检查间隔 | `--detach` |
 | result_path | detached worker 结果文件 | `--detach` |
+| event_path | `butler-event-v1`终态事件文件 | `--detach` |
 | log_path | detached worker 日志文件 | `--detach` |
 | finished_at | worker 结束时间 | detached worker |
 
@@ -57,9 +59,9 @@ Relay 接受两类输入：
 
 | 状态 | 含义 | 下一步 |
 |---|---|---|
-| starting | detached worker 已创建，还未进入执行 | heartbeat 调 `--collect` |
-| running | Claude 正在执行或续接执行 | heartbeat 调 `--collect` |
-| switching_window | Claude 要求换窗，Relay 正在交接 | heartbeat 调 `--collect` |
+| starting | detached worker 已创建，还未进入执行 | 本地等待终态事件 |
+| running | Claude 正在执行或续接执行 | 不向Codex传递中间态 |
+| switching_window | Claude 要求换窗，Relay 正在交接 | 本地继续等待终态事件 |
 | awaiting_acceptance | Claude 返回 `GOAL_DONE` | Codex 检查文件、测试和用户可见结果 |
 | needs_decision | Claude 返回 `NEED_DECISION` | Codex 决策，必要时询问用户 |
 | protocol_error | Claude 已结束但未给出终态信号 | Codex 检查结果并发送纠正指令 |
@@ -80,27 +82,29 @@ Claude/Butler 只能用以下终态信号结束接力：
 
 Relay 会识别前 5 个非空行内的独立信号，也接受最后一行以信号开头并跟随摘要。正文里提到 `GOAL_DONE` 不会被当成终态。
 
-## Heartbeat Contract
+## Event and Watchdog Contract
 
-`--collect` 是 heartbeat 的唯一正常检查入口。
+正常路径由detached worker在终态原子写入`butler-event-v1`。事件只包含`goal_id`、signal、项目路径、结果路径、SHA-256与完成时间；完整结果不重复搬运。
 
-运行中返回：
+当前Codex App没有供独立进程调用的稳定thread callback，因此Relay同时发送macOS通知。`--collect`只在用户返回、收到通知或远期watchdog时读取终态事件并验证`goal_id`、路径和摘要。
+
+首次watchdog为6小时。若仍运行，返回：
 
 ```text
 GOAL_RUNNING
-NEXT_CHECK_MINUTES=20
+NEXT_WATCHDOG_MINUTES=1440
 ```
 
-每次未完成会把间隔翻倍：`10 -> 20 -> 40 -> 80 -> ...`。运行中不应读取项目、不检查 screen、不向用户复述普通进度。
+运行态返回幂等，不因重复调用继续放大间隔。运行中不应读取项目、不检查screen、不向用户复述普通进度。
 
-终态时直接返回 worker 保存的结果文本。Codex 随后做验收、决策或故障处理。
+终态时返回signal和最小事件。Codex按结果指针读取真实成果，随后做验收、决策或故障处理。
 
 ## Recovery Rules
 
-1. 如果 `--collect` 返回 `GOAL_RUNNING`，只更新下一次 heartbeat。
+1. 如果`--collect`返回`GOAL_RUNNING`，只把同一watchdog移到24小时后。
 2. 如果返回 `GOAL_DONE`，先验证真实文件和测试，再 `--accept`。
 3. 如果返回 `NEED_DECISION`，优先由 Codex 在原目标边界内决策；只有影响用户意图时再询问用户。
-4. 如果返回 `RELAY_FAILED` 或状态为 `failed`，读取 `log_path` 与 `result_path`，定位一次具体失败。
+4. 如果返回`RELAY_FAILED`或事件摘要校验失败，读取一次`log_path`与`result_path`，定位具体失败。
 5. 如果 screen 丢失但没有终态，不伪造完成；发送明确缺陷或重启新的 Goal。
 6. 只允许关闭 `butler-native-*` 命名的 screen，避免误杀用户会话。
 
@@ -116,4 +120,3 @@ Relay 不做这些事：
 - 不替代 Codex 的最终验收。
 
 这些边界保护了项目的轻量性：Relay 是接力窄腰，不是第二个项目管理系统。
-

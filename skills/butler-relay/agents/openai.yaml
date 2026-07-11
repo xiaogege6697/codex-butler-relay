@@ -1,4 +1,4 @@
 interface:
   display_name: "管家接力器"
-  short_description: "异步交给 Claude，10 分钟起指数退避检查"
-  default_prompt: "使用 $butler-relay 异步把我的目标交给前台 Claude/Butler；派发后结束本轮，同线程首次 10 分钟检查，未完成按 20、40、80 分钟翻倍，运行中静默，终态后停止监测并真实验收。"
+  short_description: "事件优先交给 Claude，仅保留远期 watchdog"
+  default_prompt: "使用 $butler-relay 以 goal-capsule-v1 异步把目标交给前台 Claude/Butler；运行中不轮询，Relay 终态写 butler-event-v1 并通知，只保留 6 小时后一次 watchdog（仍运行则 24 小时），终态后真实验收。"
