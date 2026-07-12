@@ -10,7 +10,7 @@ Use Codex for planning, key decisions, and acceptance. Use Claude Code with `/bu
 ## Goal Loop
 
 1. Use the current workspace or an explicit user path as the project directory. Never search memory or scan the home directory merely to guess a project; ask once if neither is safe.
-2. Run `butler-relay --check` only after first installation or evidence of an environment failure, not before every Goal.
+2. In each new Codex window, run `butler-relay --check` once when this Skill is first loaded. It checks local dependencies, Claude CLI, Butler Skill format, and directly probes the unified temporary-worker router until the first provider succeeds. Do not start Claude, a Goal, screen, or Terminal for this check. `READY` proceeds normally; `DEGRADED` means Claude can work without a temporary worker; `BLOCKED` reports only the missing core dependency and shortest fix. Do not repeat the check in the same window unless a real failure occurs.
 3. Forward a concise goal containing only intent/outcome, user-stated boundaries, acceptance criteria, and authoritative project anchors. Relay wraps it as `goal-capsule-v1`. Do not pre-plan Claude's subtasks, tools, worker routing, or reporting format.
 4. Start a fresh visible Goal Loop asynchronously. A new Goal gets a new Claude session and loads `/butler` once:
 

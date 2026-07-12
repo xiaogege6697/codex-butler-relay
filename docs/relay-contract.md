@@ -28,6 +28,16 @@ Relay 接受两类输入：
 
 新 Goal 必须使用 `--goal`，它会启动新 session 并只在首次加载 `/butler`。后续续接不重复加载 Butler。
 
+## First-load Quick Check
+
+每个Codex新窗口首次加载Skill时只运行一次`butler-relay --check`。该检查只验证本地依赖、Claude CLI、Butler Skill格式，并直接调用统一worker一次；worker按自身配置找到首个可用provider即停止。自检不得启动Claude、Goal、screen或Terminal。
+
+- `READY`：核心依赖和至少一个临时工可用。
+- `DEGRADED`：核心依赖可用，但临时工探针失败；Claude仍可直接执行。
+- `BLOCKED`：核心依赖缺失；只报告缺失项和最短修复方法。
+
+同一窗口不重复检查，除非出现真实故障。
+
 ## State File
 
 目标项目根目录只保存一个状态文件：

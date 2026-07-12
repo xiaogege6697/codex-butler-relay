@@ -67,6 +67,8 @@ butler-relay --check
 
 > 打开接力器，把这个任务交给 Claude，做好后直接给我成果。
 
+当前Codex窗口首次加载时，Skill只运行一次`butler-relay --check`：检查本地依赖、Claude CLI、Butler Skill格式，并直接调用统一worker找到第一个可用provider。它不会为了自检启动Claude、Goal、screen或Terminal。结果为`READY`、`DEGRADED`或`BLOCKED`；同一窗口不重复检查，除非出现真实故障。
+
 ## 使用
 
 ```bash

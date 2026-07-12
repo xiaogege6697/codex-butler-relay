@@ -402,6 +402,43 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(value["mode"], "interactive")
 
     @patch("relay.subprocess.run")
+    def test_quick_worker_check_stops_at_first_available_provider(self, run):
+        worker = self.project / "butler_worker.py"
+        python = self.project / "python"
+        worker.write_text("# worker", encoding="utf-8")
+        python.write_text("# python", encoding="utf-8")
+        run.return_value.returncode = 0
+        run.return_value.stdout = "WORKER_READY\n"
+        run.return_value.stderr = "WORKER_OK provider=agnes model=agnes-2.0-flash\n"
+        result = relay.quick_worker_check(worker, python)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["provider"], "agnes")
+        self.assertEqual(result["model"], "agnes-2.0-flash")
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.kwargs["timeout"], 45)
+
+    @patch("relay.subprocess.run")
+    def test_quick_worker_check_reports_degraded_without_false_success(self, run):
+        worker = self.project / "butler_worker.py"
+        python = self.project / "python"
+        worker.write_text("# worker", encoding="utf-8")
+        python.write_text("# python", encoding="utf-8")
+        run.return_value.returncode = 1
+        run.return_value.stdout = ""
+        run.return_value.stderr = "WORKER_FAILED no provider\n"
+        result = relay.quick_worker_check(worker, python)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("WORKER_FAILED", result["reason"])
+
+    def test_quick_worker_check_reports_missing_entrypoint(self):
+        result = relay.quick_worker_check(
+            self.project / "missing-worker.py", self.project / "missing-python"
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "统一worker未安装")
+
+    @patch("relay.subprocess.run")
     def test_headless_loads_butler_only_for_new_session(self, run):
         run.side_effect = [
             self.response("首次完成", "session-one"),

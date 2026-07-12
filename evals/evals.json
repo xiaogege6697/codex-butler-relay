@@ -1,8 +1,14 @@
 {
-  "version": "0.2.0",
+  "version": "0.3.0",
   "project": "codex-butler-relay",
   "purpose": "验证 Relay 是否守住轻量 Goal Loop 的稳定契约，而不是退化为重型调度器或普通轮询脚本。",
   "evals": [
+    {
+      "id": "first_window_check_is_quick_and_direct",
+      "mode": "behavior",
+      "given": "Codex新窗口首次加载butler-relay Skill",
+      "expect": "只运行一次--check；验证基础依赖、Claude CLI、Butler Skill和统一worker首个可用provider，不启动Claude、Goal、screen或Terminal。"
+    },
     {
       "id": "new_goal_wraps_minimal_contract",
       "mode": "unit",

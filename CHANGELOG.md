@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 - 2026-07-12
+
+### 优化
+
+- 当前Codex窗口首次加载时只运行一次`butler-relay --check`，不启动Claude、Goal、screen或Terminal。
+- 快速自检验证本地依赖、Claude CLI、Butler Skill格式，并直接调用统一worker一次；worker找到首个可用provider即停止。
+- 自检统一返回`READY`、`DEGRADED`或`BLOCKED`：临时工不可用不阻塞Claude主链。
+
 ## 0.4.0 - 2026-07-11
 
 ### 新功能

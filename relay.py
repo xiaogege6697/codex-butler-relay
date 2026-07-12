@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -537,6 +538,50 @@ def command_version(command: str, *args: str) -> str | None:
     return output.splitlines()[0] if output else None
 
 
+def quick_worker_check(
+    worker_path: Path | None = None, python_path: Path | None = None
+) -> dict[str, object]:
+    worker = worker_path or Path.home() / ".claude" / "scripts" / "butler_worker.py"
+    python = python_path or Path.home() / ".claude" / "venv" / "bin" / "python"
+    if not worker.is_file():
+        return {"ok": False, "path": str(worker), "reason": "统一worker未安装"}
+    if not python.is_file():
+        return {"ok": False, "path": str(python), "reason": "Claude worker Python环境不存在"}
+    try:
+        completed = subprocess.run(
+            [
+                str(python),
+                str(worker),
+                "只输出 WORKER_READY",
+                "--max-tokens",
+                "128",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "path": str(worker), "reason": str(exc)[:180]}
+    evidence = re.search(
+        r"WORKER_OK provider=([^\s]+) model=([^\s]+)", completed.stderr
+    )
+    if completed.returncode == 0 and evidence:
+        return {
+            "ok": True,
+            "path": str(worker),
+            "provider": evidence.group(1),
+            "model": evidence.group(2),
+        }
+    reason = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "worker探针失败"
+    return {
+        "ok": False,
+        "path": str(worker),
+        "exit_code": completed.returncode,
+        "reason": reason[:240],
+    }
+
+
 def environment_check(project: Path) -> dict[str, object]:
     claude_path = shutil.which(CLAUDE)
     screen_path = shutil.which(SCREEN)
@@ -557,7 +602,18 @@ def environment_check(project: Path) -> dict[str, object]:
         Path.home() / ".claude" / "skills" / "butler" / "SKILL.md",
         Path.home() / ".claude" / "commands" / "butler.md",
     )
-    butler_skill = next((str(path) for path in butler_candidates if path.is_file()), None)
+    butler_path = next((path for path in butler_candidates if path.is_file()), None)
+    butler_valid = False
+    if butler_path:
+        try:
+            butler_valid = bool(
+                re.search(
+                    r"(?m)^name:\s*[\"']?butler[\"']?\s*$",
+                    butler_path.read_text(encoding="utf-8", errors="replace")[:2000],
+                )
+            )
+        except OSError:
+            butler_valid = False
     checks = {
         "macos": {"ok": platform.system() == "Darwin", "value": platform.platform()},
         "python": {"ok": sys.version_info >= (3, 10), "version": platform.python_version()},
@@ -580,9 +636,19 @@ def environment_check(project: Path) -> dict[str, object]:
             "ok": TRANSCRIPT_ROOT.is_dir() and os.access(TRANSCRIPT_ROOT, os.R_OK),
             "path": str(TRANSCRIPT_ROOT),
         },
-        "butler_skill": {"ok": butler_skill is not None, "path": butler_skill},
+        "butler_skill": {
+            "ok": butler_valid,
+            "path": str(butler_path) if butler_path else None,
+        },
     }
-    return {"ok": all(value["ok"] for value in checks.values()), "checks": checks}
+    core_ok = all(value["ok"] for value in checks.values())
+    worker = quick_worker_check() if core_ok else {
+        "ok": False,
+        "reason": "基础依赖未通过，跳过模型探针",
+    }
+    checks["temporary_worker"] = worker
+    status = "BLOCKED" if not core_ok else ("READY" if worker["ok"] else "DEGRADED")
+    return {"ok": core_ok, "status": status, "checks": checks}
 
 
 def relay_status(project: Path) -> dict[str, object]:
